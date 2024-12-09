@@ -13,12 +13,12 @@ import numpy as np
 import random as r
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
-
+import LHS_matrix
 
 #define the pade layer
 class Pade_Layer(nn.Module):
     
-    def __init__(self, parameter_dim, num_timesteps, pade_num_order, pade_denom_order, batch_size, epsilon):
+    def __init__(self, parameter_dim, num_X, pade_num_order, pade_denom_order, batch_size, epsilon):
         
         super(Pade_Layer, self).__init__()
         
@@ -59,13 +59,13 @@ class Pade_Layer(nn.Module):
     
         
         #PNO layer
-        num_coeffs = x5[ 0:(self.fc_p_nc)]
+        num_coeffs = 2*(x5[ 0:(self.fc_p_nc)] - 0.5)
         num_powers = pade_num_order*x5[ self.fc_p_nc:(self.fc_p_nc + self.fc_p_np)]
-        denom_coeffs = x5[(self.fc_p_nc + self.fc_p_np):(self.fc_p_nc + self.fc_p_np + self.fc_p_dc)]
+        denom_coeffs = 2*(x5[(self.fc_p_nc + self.fc_p_np):(self.fc_p_nc + self.fc_p_np + self.fc_p_dc)] - 0.5)
         denom_powers = pade_denom_order*x5[(self.fc_p_nc + self.fc_p_np + self.fc_p_dc):(self.fc_p_nc + self.fc_p_np + self.fc_p_dc + self.fc_p_dc)]
         
-        time_num = time.reshape(num_timesteps, 1)
-        time_denom = time.reshape(num_timesteps, 1)
+        time_num = time.reshape(num_X, 1)
+        time_denom = time.reshape(num_X, 1)
         time_num = time_num.repeat(1, pade_num_order)
         time_denom = time_denom.repeat(1, pade_denom_order)
         
@@ -79,80 +79,122 @@ class Pade_Layer(nn.Module):
     
 class Pade_Neural_Operator(nn.Module):
     
-    def __init__(self, parameter_dim, num_timesteps, pade_num_order, pade_denom_order, batch_size, epsilon):
+    def __init__(self, parameter_dim, num_points, pade_num_order, pade_denom_order, batch_size, epsilon):
         
         super(Pade_Neural_Operator, self).__init__()
         
         #pade layers
         
-        self.pade1 = Pade_Layer(parameter_dim, num_timesteps, pade_num_order, pade_denom_order, batch_size, epsilon)
-        self.pade2 = Pade_Layer(parameter_dim, num_timesteps, pade_num_order, pade_denom_order, batch_size, epsilon)
+        self.pade1 = Pade_Layer(parameter_dim, num_points, pade_num_order, pade_denom_order, batch_size, epsilon)
+        self.pade2 = Pade_Layer(parameter_dim, num_points, pade_num_order, pade_denom_order, batch_size, epsilon)
+        self.pade3 = Pade_Layer(parameter_dim, num_points, pade_num_order, pade_denom_order, batch_size, epsilon)
+        self.pade4 = Pade_Layer(parameter_dim, num_points, pade_num_order, pade_denom_order, batch_size, epsilon)
         
-        self.weights_layer = nn.Linear(in_features= parameter_dim, out_features= 1)
+        self.weights_layer_X = nn.Linear(in_features= parameter_dim, out_features= 1)
+        self.weights_layer_Y = nn.Linear(in_features= parameter_dim, out_features= 1)
         
-    def forward(self, x, time):
+        
+    def forward(self, x, X, Y):
         
         
         #pade layers
-        output1 = self.pade1(x, time)
-        output2 = self.pade2(x, time)
+        output1 = self.pade1(x, X)
+        output2 = self.pade2(x, Y)
+        output3 = self.pade3(x, X)
+        output4 = self.pade4(x, Y)
+        weights_X = self.weights_layer_X(x)
+        weights_Y = self.weights_layer_Y(x)
         
-        weights = self.weights_layer(x)
         
-        return weights[0]*output1 + output2 
+        return weights_X[0]*torch.outer(output1, output2) + weights_Y[0]*torch.transpose(torch.outer(output3, output4), 0, 1)
+    
+# Create a custom dataset that dynamically computes slices
+class CustomDataset(torch.utils.data.Dataset):
+    def __init__(self, Fs, samples, LHSs, num_timesteps):
+        self.Fs = Fs
+        self.samples = samples
+        self.LHSs = LHSs
+        self.num_timesteps = num_timesteps
+        self.num_samples = len(samples)
 
-def train_model(pade_neural_operator, criterion, optimizer, sample_data, LS_data, run, learn_rate, LS_var_train_index, num_epochs=1, batchsize=20):
+    def __len__(self):
+        return (self.num_samples * (self.num_timesteps - 1))
+
+    def __getitem__(self, index):
+        sample_idx = index // (self.num_timesteps - 1)
+        timestep_idx = index % (self.num_timesteps - 1)
+
+        F_current = self.Fs[sample_idx * self.num_timesteps + timestep_idx + 1]
+        F_previous = self.Fs[sample_idx * self.num_timesteps + timestep_idx]
+        sample = self.samples[sample_idx]
+        LHS = self.LHSs[sample_idx]
+
+        return F_current, F_previous, sample, LHS
+
+def train_model(pade_neural_operator, criterion, optimizer, sample_data, Fs_data, run, learn_rate, batch_size, LHSs, scalings, num_epochs=1, batchsize=20, use_GPU = True):
     
     # Reshape data into (num_samples * num_timesteps, X_size, Y_size)
-    num_samples, num_timesteps = LS_data.shape
+    num_samples, num_timesteps, num_X, num_Y = Fs_data.shape
     _, parameter_dim = sample_data.shape
     
     
     # Convert to tensor and prepare DataLoader
-    LS_tensor = torch.from_numpy(LS_data).float()  # Add channel dimension
+    Fs_tensor = torch.from_numpy(Fs_data).float()  
     sample_tensor = torch.from_numpy(sample_data).float()
-    time = torch.linspace(0, num_timesteps-1, num_timesteps)                      #time variable to create pade approximant
+    LHSs_tensor = torch.from_numpy(LHSs).float()
     
-    if torch.cuda.is_available():
+    # LHSs_tensor.unsqueeze_(1)
+    # LHSs_tensor = LHSs_tensor.expand(-1, num_timesteps, -1, -1).to_sparse()
+    
+    Xs = torch.linspace(0, 1, num_X)                      #X variable to create pade approximant
+    Ys = torch.linspace(0, 1, num_Y)                      #Y variable to create pade approximant
+    
+    if torch.cuda.is_available() and use_GPU:
         print("CUDA available")
         device = torch.device("cuda:0")  # Specify the GPU device
-        LS_tensor = LS_tensor.to(device)
+        Fs_tensor = Fs_tensor.to(device)
         sample_tensor = sample_tensor.to(device)
-        time = time.to(device)
+        Xs = Xs.to(device)
+        Ys = Ys.to(device)
+        LHSs_tensor = LHSs_tensor.to(device)
     
+    #reshape to make time dimension same
     
-    dataset = TensorDataset(sample_tensor, LS_tensor)
+    Fs_tensor = torch.reshape(Fs_tensor, (num_samples*num_timesteps, num_X, num_Y))
+    #sample_tensor = torch.reshape(sample_tensor, (num_samples*num_timesteps, parameter_dim))
+    #LHSs_tensor = torch.reshape(LHSs_tensor, (num_samples*num_timesteps, num_X*num_Y,  num_X*num_Y))
+
+    dataset = CustomDataset(Fs_tensor, sample_tensor, LHSs_tensor, num_timesteps)
     
     dataloader = DataLoader(dataset, batch_size=batchsize, shuffle=True)
-    
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=1 / 1.2)
 
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         batch_num = 0
         
-        for batch_inputs, batch_outputs in dataloader:
+        for batch_outputs_cur_t, batch_outputs_prev_t, batch_inputs, batch_LHS in dataloader:
             
             # Get a batch of data
             sample = batch_inputs[0]  # Shape: (batchsize, 1, X_size, Y_size)
-            LS_var = batch_outputs[0]
-            
+            Fs = batch_outputs_cur_t[0]
+            Fs_prev = batch_outputs_prev_t[0]
+            LHS = batch_LHS[0]
+
             # Forward pass
-            prediction = pade_neural_operator(sample, time)
-            
-            
+            prediction = pade_neural_operator(sample, Xs, Ys)
             
             if batch_num % 20 == 0 and epoch % 200 == 0: 
                 pred = prediction.detach().cpu().numpy()
-                LS_true = LS_var.detach().cpu().numpy()
-                plt.plot(range(num_timesteps), pred, color = 'red')
-                plt.plot(range(num_timesteps), LS_true, color = 'k')
+                plt.imshow(pred)
                 plt.show()
             
-            #l2_reg = sum(p.pow(2.0).sum() for p in pade_neural_operator.parameters())
+            V = torch.reshape(prediction, (num_X*num_Y, 1))
             
             
-            loss = criterion(prediction, LS_var)/torch.var(LS_var)
+            Fs_reshaped = torch.reshape(Fs, (1, num_X*num_Y))
+            Fs_prev_reshaped = torch.reshape(Fs_prev, ((num_X*num_Y), 1))
+            loss = residual_loss(V, LHS, Fs_prev_reshaped, Fs_reshaped)
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
@@ -179,52 +221,49 @@ def train_model(pade_neural_operator, criterion, optimizer, sample_data, LS_data
         # Save model periodically
         if (epoch + 1) % 10000 == 0:
             print("Saving model...\n")
-            torch.save(pade_neural_operator.state_dict(), "PNO_state_LSvar_"+str(LS_var_train_index)+"_run_"+str(run)+"_"+str(epoch+1)+".pth")
+            torch.save(pade_neural_operator.state_dict(), "PNO_state_run_"+str(run)+"_"+str(epoch+1)+".pth")
 
-def wasserstein_1d(x, y):
-    x_sorted, _ = torch.sort(x)
-    y_sorted, _ = torch.sort(y)
-    return torch.mean(torch.abs(x_sorted - y_sorted))
-
+def residual_loss(V, LHS, RHS, X):
+    
+    q = torch.matmul(torch.linalg.inv(torch.matmul(torch.matmul(torch.transpose(V, 0, 1), LHS), V)), torch.matmul(torch.transpose(V, 0, 1), RHS))
+    r = torch.matmul(torch.matmul(LHS, V), q) -  RHS
+    
+    return torch.linalg.norm(r, dim=0, ord = 2)
     
 #Latent space trajectory finder
 if __name__ == "__main__":
     
-    LS_data_file = "LS_dataset_train_data.npy"              #dataset variable for the latent space (outputs)
-    sample_data_file = "sample_data.npy"                    #dataset variable for the sample data (inputs)
+    Fs_data_file = "Fs_sparse.npy"              #dataset variable for the latent space (outputs)
+    sample_data_file = "sample_data_sparse.npy"                    #dataset variable for the sample data (inputs)
+    scaling_factors_file = "scaling_factors_sparse.npy"
     batch_size = 50                                         #batch size
     epsilon = 1e-7                                          #small coefficient for pade neural operator
     
     load_model = False
     restart_training = False
-    use_CUDA = True
+    use_CUDA =  True
     run_to_load = 11
     epoch_to_load = 10000
-    LS_var_to_load = 2
-    learn_rate = 1e-5
-    batch_size = 20
+    learn_rate = 1e-3
+    batch_size = 1
     run = 12
     num_epochs = 200000
     
     #pade neural operator controls
     pade_num_order = 9
     pade_denom_order = 8
-    LS_var_train_index = 0                                                            #index of latent space variable to train
+                                                    #index of latent space variable to train
 
 
-    print("Loading latent space dataset and sample dataset...")
-    LS_data = np.load(LS_data_file).astype(np.float32)
+    print("Loading dataset and sample dataset...")
+    Fs_data = np.load(Fs_data_file).astype(np.float32)
     sample_data = np.load(sample_data_file).astype(np.float32)
-    num_samples, num_timesteps, num_latent_space_vars = LS_data.shape
+    scalings = np.load(scaling_factors_file).astype(np.float32)
+    num_samples, num_timesteps, num_X, num_Y = Fs_data.shape
     _, parameter_dim = sample_data.shape
     
-    #show the latent space trajectories
-    for sample in range(num_samples - 3):
-        plt.plot(range(num_timesteps), LS_data[sample, :, LS_var_train_index], color = 'k')
-    plt.show()
-    
     #create pade neural operator 
-    pade_neural_operator = Pade_Neural_Operator(parameter_dim, num_timesteps, pade_num_order, pade_denom_order, batch_size, epsilon)
+    pade_neural_operator = Pade_Neural_Operator(parameter_dim, num_X, pade_num_order, pade_denom_order, batch_size, epsilon)
     
     if torch.cuda.is_available() and use_CUDA:
         device = torch.device("cuda:0")  # Specify the GPU device
@@ -233,21 +272,28 @@ if __name__ == "__main__":
     
     criterion = nn.MSELoss()
     optimizer = optim.Adam(list(pade_neural_operator.parameters())  , lr=learn_rate)
-
-    LS_data_one_var = LS_data[:, :, LS_var_train_index]
+    
+    LHSs = np.zeros((num_samples, num_X*num_Y, num_X*num_Y))
+    
+    for sample_idx in range(num_samples):
+        
+        LHSs[sample_idx, :, :] = LHS_matrix.generate_LHS_matrix(sample_data[sample_idx, :], num_X)
+        
+    
+        
 
     # Train the model
     if (load_model):
         print("Loading model...\n")
-        pade_neural_operator.load_state_dict(torch.load("PNO_state_LSvar_"+str(LS_var_to_load)+"_run_"+str(run_to_load)+"_"+str(epoch_to_load)+".pth"))
+        pade_neural_operator.load_state_dict(torch.load("PNO_state_run_"+str(run_to_load)+"_"+str(epoch_to_load)+".pth"))
 
     elif (restart_training):
         print("Starting training with restart...\n")
-        pade_neural_operator.load_state_dict(torch.load("PNO_state_LSvar_"+str(LS_var_to_load)+"_run_"+str(run_to_load)+"_"+str(epoch_to_load)+".pth"))
-        train_model(pade_neural_operator, criterion, optimizer, sample_data, LS_data_one_var, run, learn_rate, LS_var_train_index, num_epochs, batch_size)
+        pade_neural_operator.load_state_dict(torch.load("PNO_state_run_"+str(run_to_load)+"_"+str(epoch_to_load)+".pth"))
+        train_model(pade_neural_operator, criterion, optimizer, sample_data, Fs_data, run, learn_rate, batch_size, LHSs, scalings, num_epochs )
     else:
         print("Starting training...\n")
-        train_model(pade_neural_operator, criterion, optimizer, sample_data, LS_data_one_var, run, learn_rate, LS_var_train_index, num_epochs, batch_size)
+        train_model(pade_neural_operator, criterion, optimizer, sample_data, Fs_data, run, learn_rate, batch_size, LHSs, scalings, num_epochs)
 
     # Test with a new sample
 
