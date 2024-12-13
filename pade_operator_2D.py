@@ -41,10 +41,11 @@ class Pade_Layer(nn.Module):
         self.fc4 = nn.Linear(in_features=self.fc_3, out_features=self.fc_4)
         self.fc5 = nn.Linear(in_features=self.fc_4, out_features=(self.fc_p_nc + self.fc_p_np + self.fc_p_dc + self.fc_p_dp))
         
-
+        self.M = num_X
         
         
         self.fc6 = nn.Linear(in_features = parameter_dim, out_features = (self.fc_p_nc + self.fc_p_np + self.fc_p_dc + self.fc_p_dp))
+        self.e = epsilon
         
         
     def forward(self, x, time):
@@ -60,16 +61,16 @@ class Pade_Layer(nn.Module):
         
         #PNO layer
         num_coeffs = 2*(x5[ 0:(self.fc_p_nc)] - 0.5)
-        num_powers = pade_num_order*x5[ self.fc_p_nc:(self.fc_p_nc + self.fc_p_np)]
+        num_powers = self.fc_p_nc*x5[ self.fc_p_nc:(self.fc_p_nc + self.fc_p_np)]
         denom_coeffs = 2*(x5[(self.fc_p_nc + self.fc_p_np):(self.fc_p_nc + self.fc_p_np + self.fc_p_dc)] - 0.5)
-        denom_powers = pade_denom_order*x5[(self.fc_p_nc + self.fc_p_np + self.fc_p_dc):(self.fc_p_nc + self.fc_p_np + self.fc_p_dc + self.fc_p_dc)]
+        denom_powers = self.fc_p_dc*x5[(self.fc_p_nc + self.fc_p_np + self.fc_p_dc):(self.fc_p_nc + self.fc_p_np + self.fc_p_dc + self.fc_p_dc)]
         
-        time_num = time.reshape(num_X, 1)
-        time_denom = time.reshape(num_X, 1)
-        time_num = time_num.repeat(1, pade_num_order)
-        time_denom = time_denom.repeat(1, pade_denom_order)
+        time_num = time.reshape(self.M, 1)
+        time_denom = time.reshape(self.M, 1)
+        time_num = time_num.repeat(1, self.fc_p_nc)
+        time_denom = time_denom.repeat(1, self.fc_p_dc)
         
-        pade = torch.sum((num_coeffs*((time_num + epsilon)**num_powers)), dim = 1)/(torch.sum(((denom_coeffs*((time_denom + epsilon)**denom_powers))), dim =1)) 
+        pade = torch.sum((num_coeffs*((time_num + self.e)**num_powers)), dim = 1)/(torch.sum(((denom_coeffs*((time_denom + self.e)**denom_powers))), dim =1)) 
         
         short = torch.sum(f.tanh(self.fc6(x)))
         
@@ -219,7 +220,7 @@ def train_model(pade_neural_operator, criterion, optimizer, sample_data, Fs_data
     
         
         # Save model periodically
-        if (epoch + 1) % 10000 == 0:
+        if (epoch + 1) % 1000 == 0:
             print("Saving model...\n")
             torch.save(pade_neural_operator.state_dict(), "PNO_state_run_"+str(run)+"_"+str(epoch+1)+".pth")
 
@@ -233,20 +234,19 @@ def residual_loss(V, LHS, RHS, X):
 #Latent space trajectory finder
 if __name__ == "__main__":
     
-    Fs_data_file = "Fs_sparse.npy"              #dataset variable for the latent space (outputs)
-    sample_data_file = "sample_data_sparse.npy"                    #dataset variable for the sample data (inputs)
-    scaling_factors_file = "scaling_factors_sparse.npy"
-    batch_size = 50                                         #batch size
+    Fs_data_file = "Fs.npy"              #dataset variable for the latent space (outputs)
+    sample_data_file = "sample_data.npy"                    #dataset variable for the sample data (inputs)
+    scaling_factors_file = "scaling_factors.npy"
     epsilon = 1e-7                                          #small coefficient for pade neural operator
     
     load_model = False
-    restart_training = False
+    restart_training = True
     use_CUDA =  True
-    run_to_load = 11
-    epoch_to_load = 10000
-    learn_rate = 1e-3
-    batch_size = 1
-    run = 12
+    run_to_load = 12
+    epoch_to_load = 50000
+    learn_rate = 5e-4
+    batch_size = 200
+    run = 13
     num_epochs = 200000
     
     #pade neural operator controls

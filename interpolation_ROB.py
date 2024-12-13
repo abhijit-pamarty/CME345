@@ -19,7 +19,7 @@ def interpolate_V(Vs, samples, sample_point):
     
     #here samples is a 1d function representing the peclet number
     
-    debug_GUI = True
+    debug_GUI = False
     print("Interpolating Vs...")
     
     #put in tangent space
